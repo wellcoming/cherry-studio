@@ -25,6 +25,41 @@ async function readPathBackedClipboardEntry(
   return selectedFile ? { kind: 'attachment', attachment: toComposerAttachment(selectedFile) } : { kind: 'empty' }
 }
 
+const CLIPBOARD_IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'image/bmp': '.bmp',
+  'image/gif': '.gif'
+}
+
+async function attachClipboardImage(file: File): Promise<ComposerAttachment | null> {
+  const tempFilePath = await window.api.file.createTempFile(file.name)
+  const arrayBuffer = await file.arrayBuffer()
+  await window.api.file.write(tempFilePath, new Uint8Array(arrayBuffer))
+  const selectedFile = await window.api.file.get(tempFilePath)
+  return selectedFile ? toComposerAttachment({ ...selectedFile, origin_name: removeFileExtension(file.name) }) : null
+}
+
+// Flatpak and other sandboxed apps put a path on the clipboard that the host cannot
+// resolve, while the image bytes stay available to every app that pastes them.
+async function readClipboardImage(supportExts: Set<string>): Promise<File | null> {
+  if (!navigator.clipboard?.read) return null
+  try {
+    for (const item of await navigator.clipboard.read()) {
+      for (const type of item.types) {
+        const extension = CLIPBOARD_IMAGE_EXTENSIONS[type]
+        if (extension && supportExts.has(extension)) {
+          return new File([await item.getType(type)], `clipboard${extension}`, { type })
+        }
+      }
+    }
+  } catch (error) {
+    logger.verbose('clipboard image unavailable:', error as Error)
+  }
+  return null
+}
+
 // Track last focused component
 type ComponentType = 'inputbar' | 'messageEditor' | 'TranslatePage' | null
 let lastFocusedComponent: ComponentType = 'inputbar' // Default to inputbar
@@ -105,6 +140,12 @@ export const handlePaste = async (
         const pathBackedEntries = clipboardEntries.filter((entry): entry is { file: File; filePath: string } =>
           Boolean(entry.filePath)
         )
+        const hasPathlessClipboardImage = clipboardEntries.some(
+          (entry) =>
+            !entry.filePath &&
+            entry.file.type.startsWith('image/') &&
+            supportExts.includes(getFileExtension(entry.file.name))
+        )
 
         if (pathBackedEntries.length === clipboardEntries.length) {
           const results = await Promise.allSettled(
@@ -112,24 +153,35 @@ export const handlePaste = async (
           )
           const attachments: ComposerAttachment[] = []
           let hasFileError = false
+          let hasUnsupportedFile = false
+          let hasUnreadableFile = false
 
           for (const result of results) {
             if (result.status === 'rejected') {
               hasFileError = true
               logger.error('onPaste:', result.reason as Error)
-            } else if (result.value.kind === 'unsupported') {
-              if (t) {
-                toast.info(t('chat.input.file_not_supported'))
-              }
             } else if (result.value.kind === 'attachment') {
               attachments.push(result.value.attachment)
-            } else if (t) {
-              toast.info(t('chat.input.file_not_supported'))
+            } else if (result.value.kind === 'unsupported') {
+              hasUnsupportedFile = true
+            } else {
+              hasUnreadableFile = true
+            }
+          }
+
+          if (hasUnreadableFile && attachments.length === 0) {
+            const clipboardImage = await readClipboardImage(extensionSet)
+            if (clipboardImage) {
+              const attachment = await attachClipboardImage(clipboardImage)
+              if (attachment) attachments.push(attachment)
             }
           }
 
           if (attachments.length > 0) {
             setFiles((prevFiles) => [...prevFiles, ...attachments])
+          }
+          if ((hasUnsupportedFile || (hasUnreadableFile && attachments.length === 0)) && t) {
+            toast.info(t('chat.input.file_not_supported'))
           }
           if (hasFileError && t) {
             toast.error(t('chat.input.file_error'))
@@ -142,19 +194,9 @@ export const handlePaste = async (
           if (!filePath) {
             // 图像生成也支持图像编辑
             if (file.type.startsWith('image/') && supportExts.includes(getFileExtension(file.name))) {
-              const tempFilePath = await window.api.file.createTempFile(file.name)
-              const arrayBuffer = await file.arrayBuffer()
-              const uint8Array = new Uint8Array(arrayBuffer)
-              await window.api.file.write(tempFilePath, uint8Array)
-              const selectedFile = await window.api.file.get(tempFilePath)
-              if (selectedFile) {
-                setFiles((prevFiles) => [
-                  ...prevFiles,
-                  toComposerAttachment({
-                    ...selectedFile,
-                    origin_name: removeFileExtension(file.name)
-                  })
-                ])
+              const attachment = await attachClipboardImage(file)
+              if (attachment) {
+                setFiles((prevFiles) => [...prevFiles, attachment])
               } else if (t) {
                 toast.info(t('chat.input.file_not_supported'))
               }
@@ -169,9 +211,7 @@ export const handlePaste = async (
           const result = await readPathBackedClipboardEntry(filePath, extensionSet)
           if (result.kind === 'attachment') {
             setFiles((prevFiles) => [...prevFiles, result.attachment])
-          } else if (result.kind === 'unsupported' && t) {
-            toast.info(t('chat.input.file_not_supported'))
-          } else if (result.kind === 'empty' && t) {
+          } else if (!hasPathlessClipboardImage && t) {
             toast.info(t('chat.input.file_not_supported'))
           }
         }

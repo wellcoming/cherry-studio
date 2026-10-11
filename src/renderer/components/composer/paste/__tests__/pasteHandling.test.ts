@@ -528,7 +528,7 @@ describe('pasteHandling', () => {
     expect(toast.info).toHaveBeenCalledWith('chat.input.file_not_supported')
   })
 
-  it('tells the user when a path-backed file lookup returns null', async () => {
+  it('tells the user when an unresolvable path-backed file has no clipboard image to fall back to', async () => {
     vi.mocked(window.api.file.getPathForFile).mockImplementation((file) => `/tmp/${file.name}`)
     vi.mocked(window.api.file.get).mockResolvedValue(null)
     const clipboardFiles = [{ name: 'gone.png', type: 'image/png' }] as File[]
@@ -588,7 +588,7 @@ describe('pasteHandling', () => {
     expect(toast.info).toHaveBeenCalledWith('chat.input.file_not_supported')
   })
 
-  it('tells the user when a mixed path-backed file lookup returns null', async () => {
+  it('falls back to the clipboard image when a mixed path-backed file lookup returns null', async () => {
     const tempImageFile: FileMetadata = {
       ...selectedFile,
       name: 'temp_file_123_image.png',
@@ -631,7 +631,79 @@ describe('pasteHandling', () => {
 
     expect(handled).toBe(true)
     expect(files).toHaveLength(1)
-    expect(toast.info).toHaveBeenCalledWith('chat.input.file_not_supported')
+    expect(files[0]).toMatchObject({ path: tempImageFile.path, origin_name: 'image' })
+    expect(toast.info).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the clipboard image when a sandboxed app exposes an unresolvable file path', async () => {
+    // Flatpak WeChat hands Chromium a file:// path the host cannot resolve, while the image
+    // bytes stay on the system clipboard for any app to paste. Chromium surfaces only the
+    // path-backed file, so the paste must recover the image from the clipboard.
+    const tempImageFile: FileMetadata = {
+      ...selectedFile,
+      name: 'temp_file_123_clipboard.png',
+      origin_name: 'temp_file_123_clipboard.png',
+      path: '/tmp/temp_file_123_clipboard.png',
+      ext: '.png',
+      type: FILE_TYPE.IMAGE
+    }
+    // jsdom's File/Blob lack arrayBuffer(); a real renderer File provides it.
+    class FakeClipboardFile {
+      name: string
+      type: string
+      constructor(_parts: BlobPart[], name: string, options?: FilePropertyBag) {
+        this.name = name
+        this.type = options?.type ?? ''
+      }
+      arrayBuffer() {
+        return Promise.resolve(new Uint8Array([1, 2, 3]).buffer)
+      }
+    }
+    vi.stubGlobal('File', FakeClipboardFile)
+
+    const pngBlob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+    const clipboardRead = vi
+      .fn()
+      .mockResolvedValue([{ types: ['image/png'], getType: vi.fn().mockResolvedValue(pngBlob) }])
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { read: clipboardRead } })
+
+    vi.mocked(window.api.file.getPathForFile).mockImplementation((file) => `/tmp/${file.name}`)
+    vi.mocked(window.api.file.createTempFile).mockResolvedValue(tempImageFile.path)
+    vi.mocked(window.api.file.get).mockImplementation((path) =>
+      path === tempImageFile.path ? Promise.resolve(tempImageFile) : Promise.resolve(null)
+    )
+
+    let files: ComposerAttachment[] = []
+    const setFiles = vi.fn((updater: (prevFiles: ComposerAttachment[]) => ComposerAttachment[]) => {
+      files = updater(files)
+    })
+    const event = {
+      preventDefault: vi.fn(),
+      clipboardData: {
+        getData: () => '',
+        files: [{ name: 'd28577d8110550a7cf1487c7a0ae482c.png', type: 'image/png' }]
+      }
+    } as unknown as ClipboardEvent
+
+    const handled = await pasteHandling.handlePaste(
+      event,
+      ['.png'],
+      setFiles,
+      undefined,
+      undefined,
+      undefined,
+      (key) => key
+    )
+
+    expect(handled).toBe(true)
+    expect(clipboardRead).toHaveBeenCalled()
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({ path: tempImageFile.path, origin_name: 'clipboard' })
+    expect(toast.info).not.toHaveBeenCalled()
+    expect(toast.error).not.toHaveBeenCalled()
+
+    vi.unstubAllGlobals()
+    Reflect.deleteProperty(navigator, 'clipboard')
   })
 
   describe('handler registration and lifecycle', () => {
